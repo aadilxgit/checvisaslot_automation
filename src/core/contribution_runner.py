@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ from pathlib import Path
 from playwright.async_api import Page, async_playwright, Error as PlaywrightError
 
 from src.auth.browser import connect_to_chrome
-from src.auth.login import wait_for_waiting_room, CloudflareBlockException
+from src.auth.login import wait_for_waiting_room, CloudflareBlockException, detect_block
 from src.auth.cdp_client import ensure_on_portal
 
 
@@ -119,7 +120,7 @@ async def try_saved_session_ofc_page(page: Page, customer: str, wait_seconds: in
     deadline = time.time() + 60
     while time.time() < deadline:
         try:
-            if await page.locator("#post_select").count() > 0 and await page.locator("#post_select").first.is_visible():
+            if await _ofc_dropdown_ready(page) and await _profile_name_visible(page):
                 _write_state(customer, {"status": "ofc_page_ready", "url": page.url, "session_reused": True})
                 log.info("Saved session active; OFC page ready.")
                 return True
@@ -140,6 +141,92 @@ async def try_saved_session_ofc_page(page: Page, customer: str, wait_seconds: in
     return False
 
 
+PROFILE_NAME_RE = re.compile(r"\(\d{6,}\)")  # header user info, e.g. "Name (754993242)"
+PORTAL_PREFIX = "https://www.usvisascheduling.com"
+
+
+def _loop_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
+async def _profile_name_visible(page: Page) -> bool:
+    try:
+        loc = page.get_by_text(PROFILE_NAME_RE)
+        return await loc.count() > 0 and await loc.first.is_visible()
+    except Exception:
+        return False
+
+
+async def _ofc_dropdown_ready(page: Page) -> bool:
+    """True when we are on the OFC page and #post_select is visible with the city options loaded."""
+    try:
+        if "/ofc-schedule" not in page.url.lower():
+            return False
+        sel = page.locator("#post_select")
+        if await sel.count() == 0 or not await sel.first.is_visible():
+            return False
+        values = await sel.first.evaluate("el => Array.from(el.options).map(o => o.value)")
+        return any(v in OFC_CITY_VALUES.values() for v in values)
+    except Exception:
+        return False
+
+
+async def wait_for_profile_overview(page: Page, customer: str, timeout_seconds: int = 120, stable_seconds: float = 2.0) -> bool:
+    """Step 4 of the portal flow: after security questions the portal redirects (b2clogin ->
+    /profile/?ReturnUrl -> /en-US/). Wait until we are on the portal, the header user info is
+    visible, and the URL has stopped changing for stable_seconds."""
+    deadline = _loop_time() + timeout_seconds
+    last_url, url_since = None, _loop_time()
+    while _loop_time() < deadline:
+        url = page.url
+        now = _loop_time()
+        if url != last_url:
+            last_url, url_since = url, now
+        if url.startswith(PORTAL_PREFIX) and now - url_since >= stable_seconds and await _profile_name_visible(page):
+            log.info(f"Profile overview ready (header user info visible): {url}")
+            return True
+        await asyncio.sleep(0.5)
+    log.error(f"Profile overview never settled (header user info missing). Current URL: {page.url}")
+    return False
+
+
+async def wait_for_ofc_ready(page: Page, customer: str, timeout_seconds: int = 120) -> bool:
+    """Step 6: start rotating only when the OFC page shows the header user info AND the
+    city dropdown is visible with its options loaded."""
+    deadline = _loop_time() + timeout_seconds
+    while _loop_time() < deadline:
+        if await _ofc_dropdown_ready(page) and await _profile_name_visible(page):
+            return True
+        marker = await detect_block(page)
+        if marker:
+            log.error(f"Block marker '{marker}' while waiting for OFC page. Current URL: {page.url}")
+            _write_state(customer, {"status": "blocked", "reason": f"page marker '{marker}'", "url": page.url})
+            sys.exit(43)
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _click_schedule_option(page: Page, timeout_seconds: int = 30) -> bool:
+    """Step 5: wait for the schedule option on the overview page to become visible, then click it."""
+    if "reschedule=true" in OFC_URL:
+        selectors = ["#reschedule_appointment", "a[href*='reschedule=true']", "a:has-text('Reschedule Appointment')"]
+    else:
+        selectors = ["#continue_application", "a[href*='/ofc-schedule']", "a:has-text('Schedule Appointment')"]
+    deadline = _loop_time() + timeout_seconds
+    while _loop_time() < deadline:
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click()
+                    log.info(f"Clicked schedule link: {selector}")
+                    return True
+            except Exception:
+                continue
+        await asyncio.sleep(0.5)
+    return False
+
+
 async def go_to_ofc_page(page: Page, customer: str) -> bool:
     if "/ofc-schedule" in page.url.lower():
         log.info("Already on OFC schedule page.")
@@ -147,20 +234,12 @@ async def go_to_ofc_page(page: Page, customer: str) -> bool:
         if not await ensure_on_portal(page, log, timeout_seconds=90):
             return False
 
-        clicked = False
-        selectors = ["#reschedule_appointment", "a[href*='reschedule=true']", "a:has-text('Reschedule Appointment')"] if "reschedule=true" in OFC_URL else ["#continue_application", "a[href*='/ofc-schedule']", "a:has-text('Schedule Appointment')"]
-        for selector in selectors:
-            try:
-                if await page.locator(selector).count() > 0:
-                    await page.locator(selector).first.click()
-                    clicked = True
-                    log.info(f"Clicked schedule link: {selector}")
-                    break
-            except Exception:
-                continue
+        if not await wait_for_profile_overview(page, customer):
+            _write_state(customer, {"status": "profile_overview_failed", "url": page.url})
+            return False
 
-        if not clicked:
-            log.info("Schedule link not found on landing page; navigating directly to OFC page.")
+        if not await _click_schedule_option(page):
+            log.info("Schedule link not found on overview page after 30s; navigating directly to OFC page.")
             try:
                 await page.goto(OFC_URL, wait_until="domcontentloaded", timeout=120_000)
             except Exception as nav_err:
@@ -186,15 +265,13 @@ async def go_to_ofc_page(page: Page, customer: str) -> bool:
 
     await _wait_for_page_idle(page)
 
-    try:
-        await page.wait_for_selector("#post_select", state="visible", timeout=60_000)
-    except Exception:
-        log.error(f"OFC city dropdown did not appear. Current URL: {page.url}")
+    if not await wait_for_ofc_ready(page, customer):
+        log.error(f"OFC page not ready (needs header user info + loaded city dropdown). Current URL: {page.url}")
         _write_state(customer, {"status": "ofc_page_failed", "url": page.url})
         return False
 
     _write_state(customer, {"status": "ofc_page_ready", "url": page.url})
-    log.info("OFC page ready.")
+    log.info("OFC page ready: header user info and city dropdown both visible.")
     return True
 
 
@@ -334,10 +411,13 @@ async def contribute_from_page(
                 # Check if we should exit with 429 cooldown
                 is_rate_limited = "429" in exc_str or "too many requests" in exc_str or "access denied" in exc_str
                 is_closed = page.is_closed() or "closed" in exc_str or "target closed" in exc_str
-                
-                if is_rate_limited:
-                    log.error(f"Rate limiting or block detected (429/Access Denied) for {customer}. Exiting with code 42 to signal restart cooldown.")
-                    sys.exit(42)
+                block_marker = None if is_closed else await detect_block(page)
+
+                if is_rate_limited or block_marker:
+                    reason = f"page marker '{block_marker}'" if block_marker else "exception text"
+                    log.error(f"Block or rate limit detected for {customer} ({reason}). Exiting with code 43: session wiped, next account.")
+                    _write_state(customer, {"status": "blocked", "reason": reason, "url": url})
+                    sys.exit(43)
                 elif is_closed:
                     log.error(f"Page or browser context was closed for {customer}. Exiting with code 42 to signal restart cooldown.")
                     sys.exit(42)

@@ -4,7 +4,9 @@ import sys
 import time
 import socket
 import logging
+import json
 import subprocess
+import zipfile
 from pathlib import Path
 from dotenv import load_dotenv
 from playwright.async_api import Page, BrowserContext
@@ -42,6 +44,24 @@ def resolve_browser_exe(log: logging.Logger) -> str:
     return CHROME_EXE
 
 
+def ensure_extension_assets(extension_path: str, log: logging.Logger) -> None:
+    """Extract the extension's img/ folder from img.zip if it is missing (the repo ships it zipped)."""
+    ext = Path(extension_path)
+    if (ext / "img").is_dir():
+        return
+    archive = ext / "img.zip"
+    if not archive.is_file():
+        log.warning(f"Extension has no img/ folder and no img.zip to extract: {ext}")
+        return
+    with zipfile.ZipFile(archive) as zf:
+        for member in zf.namelist():
+            # Only extract img/ entries, and refuse any path that escapes the extension folder.
+            if not member.startswith("img/") or ".." in Path(member).parts:
+                continue
+            zf.extract(member, ext)
+    log.info(f"Extracted extension images from {archive.name} into {ext}")
+
+
 def resolve_extension_path(log: logging.Logger) -> str:
     """Resolve the Chrome extension folder to load into Playwright Chromium."""
     repo_root = Path(__file__).resolve().parents[2]
@@ -65,6 +85,22 @@ def resolve_extension_path(log: logging.Logger) -> str:
         "or set CHECKVISA_EXTENSION_PATH to an unpacked extension folder."
     )
     sys.exit(1)
+
+def disable_password_prompts(profile_dir: str, log: logging.Logger) -> None:
+    """Turn off Chrome's save-password offer in this account's profile before launch."""
+    prefs_path = Path(profile_dir) / "Default" / "Preferences"
+    prefs_path.parent.mkdir(parents=True, exist_ok=True)
+    prefs = {}
+    if prefs_path.is_file():
+        try:
+            prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning(f"Could not read Chrome Preferences ({exc}); not changing password settings.")
+            return
+    prefs["credentials_enable_service"] = False
+    prefs.setdefault("profile", {})["password_manager_enabled"] = False
+    prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+
 
 def ensure_chrome_debug_running(
     cdp_port: int,
@@ -114,6 +150,8 @@ def ensure_chrome_debug_running(
         sys.exit(1)
 
     extension_path = resolve_extension_path(log)
+    ensure_extension_assets(extension_path, log)
+    disable_password_prompts(profile_dir, log)
     log.info(f"Using extension from: {extension_path}")
 
     subprocess.Popen([
@@ -123,6 +161,7 @@ def ensure_chrome_debug_running(
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
+        "--password-store=basic",  # no OS keyring unlock prompt on Linux
         f"--disable-extensions-except={extension_path}",
         f"--load-extension={extension_path}",
         start_url,

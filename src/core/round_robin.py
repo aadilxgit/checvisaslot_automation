@@ -150,7 +150,14 @@ class RoundRobinScheduler:
         self.last_active_account = customer
         self.last_api_key = self.current_api_key
         self.last_switch_time = datetime.now(timezone.utc).isoformat()
+        self._advance()
 
+    def skip_current(self) -> None:
+        """Moves past the current account without running it (e.g. it is in cooldown)."""
+        if self.account_order:
+            self._advance()
+
+    def _advance(self) -> None:
         self.current_account_index += 1
         if self.current_account_index >= len(self.account_order):
             # All accounts done for this API key → advance to next key

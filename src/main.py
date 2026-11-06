@@ -31,14 +31,6 @@ BASE_CDP_PORT = int(os.getenv("CHECKVISA_BASE_CDP_PORT", "9222"))
 OFC_URL = "https://www.usvisascheduling.com/en-US/ofc-schedule/"
 
 
-def now_ts() -> float:
-    return time.time()
-
-
-def ts_text(value: float) -> str:
-    return datetime.fromtimestamp(value, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] [SCHEDULER] {message}", flush=True)
 
@@ -86,6 +78,10 @@ def load_api_keys() -> list[str]:
     return ["4XYRAN"]
 
 
+# Orchestrator exit code: every account failed in a row (error / block / rate limit / Access Denied).
+EXIT_ALL_FAILED = 2
+
+
 def account_cities(account: dict) -> str:
     cities = account.get("contributionCities") or account.get("ofcCities") or ["ANY"]
     if isinstance(cities, str):
@@ -118,8 +114,45 @@ def relay_output(proc: subprocess.Popen, label: str, ready_event: threading.Even
             ready_event.set()
 
 
+def _posix_port_pids(port: int) -> set[int]:
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", "-i", f"TCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return set()
+    return {int(p) for p in result.stdout.split() if p.isdigit()}
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 def kill_port_process(port: int) -> None:
     if os.name != "nt":
+        # Linux/macOS: close whatever is listening on the CDP port (Chrome).
+        pids = _posix_port_pids(port)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                log(f"Sent SIGTERM to browser process on port {port} (PID {pid})")
+            except OSError as exc:
+                log(f"Failed to signal PID {pid}: {exc}")
+        deadline = time.time() + 5
+        while pids and time.time() < deadline and _port_open(port):
+            time.sleep(0.5)
+        if _port_open(port):
+            for pid in _posix_port_pids(port):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    log(f"Force-killed PID {pid} on port {port}")
+                except OSError:
+                    pass
         return
     try:
         result = subprocess.run(
@@ -210,8 +243,23 @@ def contribution_cmd(account: dict, port: int, args: argparse.Namespace, saved_s
     return cmd
 
 
-def run_account(account: dict, args: argparse.Namespace, env: dict, api_key: str = "4XYRAN") -> None:
-    """Run a single account's login + contribution cycle with the given API key."""
+# Session outcomes returned by run_account().
+OK = "ok"            # contributed (rotation limit reached, or session duration expired)
+BLOCKED = "blocked"  # exit 43: Cloudflare block, rate limit (429), Access Denied
+ERROR = "error"      # login failure/timeout or any other runner error
+
+
+def outcome_for(code: int | None) -> str:
+    if code == 0:
+        return OK
+    if code == 43:
+        return BLOCKED
+    return ERROR
+
+
+def run_account(account: dict, args: argparse.Namespace, env: dict, api_key: str = "4XYRAN") -> tuple[str, int | None]:
+    """Run a single account's login + contribution cycle with the given API key.
+    Returns (outcome, exit_code)."""
     customer = account["customer_name"]
     port = BASE_CDP_PORT
     profile_dir = PROFILE_ROOT / f"chrome_profile_{customer}"
@@ -224,7 +272,6 @@ def run_account(account: dict, args: argparse.Namespace, env: dict, api_key: str
         "status": "starting",
         "rotation_count": 0,
         "max_rotations": args.max_rotations,
-        "cooldown_until": None,
     })
 
     if has_saved_profile(profile_dir):
@@ -243,7 +290,7 @@ def run_account(account: dict, args: argparse.Namespace, env: dict, api_key: str
         log(f"Saved-session contribution exited for {customer} with code {code}")
         kill_port_process(port)
         if code == 0:
-            return
+            return OK, code
         time.sleep(2)
         log(f"Saved session was not usable for {customer}; falling back to login.")
 
@@ -285,7 +332,8 @@ def run_account(account: dict, args: argparse.Namespace, env: dict, api_key: str
         except Exception:
             pass
         kill_port_process(port)
-        return code
+        # login_runner exits 0 even after a handled login failure, so no [READY] is always a failure.
+        return (BLOCKED if code == 43 else ERROR), code
 
     write_account_state(customer, {
         "status": "contributing",
@@ -298,8 +346,10 @@ def run_account(account: dict, args: argparse.Namespace, env: dict, api_key: str
 
     # Enforce session duration: wait for contribution to finish OR session timer to expire
     session_deadline = time.time() + (args.session_duration_minutes * 60)
+    expired = False
     while contrib_proc.poll() is None:
         if time.time() >= session_deadline:
+            expired = True
             log(f"Session duration ({args.session_duration_minutes} min) expired for {customer}. Terminating contribution.")
             try:
                 contrib_proc.terminate()
@@ -324,14 +374,15 @@ def run_account(account: dict, args: argparse.Namespace, env: dict, api_key: str
     except Exception:
         pass
     kill_port_process(port)
-    return code
+    # Terminated by the session timer = a normal, successful session.
+    return (OK if expired else outcome_for(code)), code
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Round-robin contribution scheduler with API key rotation.")
     parser.add_argument("--dwell-seconds", type=int, default=12)
     parser.add_argument("--max-rotations", type=int, default=20)
-    parser.add_argument("--cooldown-seconds", type=int, default=3600)
+    parser.add_argument("--cooldown-seconds", type=int, default=2700, help="Per-account cooldown after every session (default 45 min). Accounts in cooldown are skipped.")
     parser.add_argument("--login-timeout-seconds", type=int, default=900)
     parser.add_argument("--min-gap-seconds", type=int, default=15)
     parser.add_argument("--max-gap-seconds", type=int, default=20)
@@ -355,7 +406,12 @@ def main() -> None:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
 
+    # Accounts that failed (error / block / rate limit) since the last successful session.
+    # When every account is in here, nothing can contribute: log it and stop.
+    failed_since_success: dict[str, str] = {}
+    # customer -> time.time() when the account may run again (memory only; lost on restart).
     cooldown_until: dict[str, float] = {}
+    exit_code = 0
     stopped = False
 
     def stop(_signum=None, _frame=None):
@@ -374,12 +430,22 @@ def main() -> None:
 
         customer = account["customer_name"]
         current_key = scheduler.current_api_key
-        available_at = cooldown_until.get(customer, 0)
 
-        if now_ts() < available_at:
-            sleep_for = max(5, min(60, int(available_at - now_ts())))
-            log(f"{customer} still in cooldown. Sleeping {sleep_for}s.")
-            time.sleep(sleep_for)
+        now = time.time()
+        if cooldown_until.get(customer, 0) > now:
+            ready_times = [cooldown_until.get(name, 0) for name in scheduler.account_order]
+            if min(ready_times) > now:
+                # Every account is cooling down: sleep until the first one is free.
+                first_free = min(ready_times)
+                wait = int(first_free - now) + 1
+                log(f"All {len(ready_times)} accounts in cooldown. Next free at {time.strftime('%H:%M:%S', time.localtime(first_free))}; sleeping {wait}s.")
+                end = time.time() + wait
+                while time.time() < end and not stopped:
+                    time.sleep(min(5, max(0.1, end - time.time())))
+                continue
+            left = int(cooldown_until[customer] - now)
+            log(f"{customer} in cooldown ({left // 60}m {left % 60}s left); skipping to next account.")
+            scheduler.skip_current()
             continue
 
         log(f"=== Round-Robin → '{customer}' | key={current_key[:4]}... "
@@ -387,14 +453,21 @@ def main() -> None:
             f"key {scheduler.current_api_key_index+1}/{len(api_keys)}, "
             f"cycle {scheduler.completed_full_cycles}) ===")
 
-        code = run_account(account, args, env, api_key=current_key)
+        outcome, code = run_account(account, args, env, api_key=current_key)
 
         scheduler.mark_session_complete(customer)
         log(f"Advanced → next: {scheduler.account_order[scheduler.current_account_index]}, "
             f"key: {scheduler.current_api_key[:4]}..., cycles: {scheduler.completed_full_cycles}")
 
-        if code == 43:
-            log(f"Cloudflare block (Code 43) detected for {customer}. Deleting user session and retrying...")
+        if stopped:
+            break
+
+        if args.cooldown_seconds > 0:
+            cooldown_until[customer] = time.time() + args.cooldown_seconds
+            log(f"{customer} cooling down for {args.cooldown_seconds // 60} min (until {time.strftime('%H:%M:%S', time.localtime(cooldown_until[customer]))}).")
+
+        if outcome == BLOCKED:
+            log(f"Block / rate limit / Access Denied (code {code}) for {customer}. Deleting user session; will retry next round.")
             profile_dir = PROFILE_ROOT / f"chrome_profile_{customer}"
             import shutil
             try:
@@ -402,21 +475,29 @@ def main() -> None:
                 shutil.rmtree(profile_dir / "Default" / "Network", ignore_errors=True)
             except Exception as ex:
                 log(f"WARNING Failed to delete session for {customer}: {ex}")
-            cooldown_until[customer] = now_ts()
-            write_account_state(customer, {
-                "status": "session_wiped_restarting",
-                "cooldown_until": ts_text(cooldown_until[customer]),
-                "max_rotations": args.max_rotations,
-            })
+        elif outcome == ERROR:
+            log(f"{customer}: session failed (code {code}); will retry next round.")
+
+        write_account_state(customer, {
+            "status": f"session_{outcome}",
+            "exit_code": code,
+            "max_rotations": args.max_rotations,
+            "cooldown_until": datetime.fromtimestamp(cooldown_until[customer], tz=timezone.utc).isoformat() if customer in cooldown_until else None,
+        })
+
+        if outcome == OK:
+            if failed_since_success:
+                log(f"{customer} contributed; resetting failure tracker ({len(failed_since_success)} failed before).")
+            failed_since_success.clear()
         else:
-            cooldown_until[customer] = now_ts() + args.cooldown_seconds
-            write_account_state(customer, {
-                "status": "cooldown",
-                "cooldown_until": ts_text(cooldown_until[customer]),
-                "cooldown_seconds": args.cooldown_seconds,
-                "max_rotations": args.max_rotations,
-            })
-            log(f"{customer} cooling down until {ts_text(cooldown_until[customer])}")
+            failed_since_success[customer] = f"{outcome} (code {code})"
+            log(f"Failures since last success: {len(failed_since_success)}/{len(accounts)} account(s).")
+            if len(failed_since_success) >= len(accounts):
+                log("ALL ACCOUNTS FAILED in a row (rate limit / Access Denied / Cloudflare / error). Stopping automation.")
+                for name, why in failed_since_success.items():
+                    log(f"  - {name}: {why}")
+                exit_code = EXIT_ALL_FAILED
+                break
 
         switch_cooldown = args.switch_cooldown_seconds
         if switch_cooldown > 0 and not stopped:
@@ -426,6 +507,9 @@ def main() -> None:
                 sleep_time = min(5, gap_remaining)
                 time.sleep(sleep_time)
                 gap_remaining -= sleep_time
+
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

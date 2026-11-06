@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -18,6 +19,9 @@ PROFILES_DIR = CODESPACE_DIR / "profiles"
 STATE_DIR = CODESPACE_DIR / "state"
 LOGS_DIR = CODESPACE_DIR / "logs"
 DEFAULT_EXTENSION_PATH = CODESPACE_DIR / "extensions" / "checkvisaslots"
+EXIT_MESSAGES = {
+    2: "Stopped: every account failed in a row (rate limit / Access Denied / Cloudflare / error).",
+}
 
 
 def ensure_dirs() -> None:
@@ -75,7 +79,7 @@ class CodespaceGui(tk.Tk):
             "dwell_seconds": 12,
             "cycles": 0,
             "max_rotations": 20,
-            "cooldown_minutes": 60,
+            "cooldown_minutes": 45,
             "min_gap_seconds": 15,
             "max_gap_seconds": 20,
             "browser_exe": "",
@@ -115,7 +119,7 @@ class CodespaceGui(tk.Tk):
 
         self._entry(form, "Customer", self.customer_var, 0)
         self._entry(form, "Username", self.username_var, 1)
-        self._entry(form, "Password", self.password_var, 2, show="*")
+        self._entry(form, "Password", self.password_var, 2)
         self._entry(form, "Cities", self.cities_var, 3)
         ttk.Checkbutton(form, text="Reschedule Mode (check booked appointments)", variable=self.account_reschedule_var).grid(row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 6))
 
@@ -125,7 +129,7 @@ class CodespaceGui(tk.Tk):
             ttk.Label(qbox, text=f"Q{idx + 1} match").grid(row=idx * 2, column=0, sticky="w", padx=4, pady=(5, 2))
             ttk.Entry(qbox, textvariable=qvar).grid(row=idx * 2, column=1, sticky="ew", padx=4, pady=(5, 2))
             ttk.Label(qbox, text="Answer").grid(row=idx * 2 + 1, column=0, sticky="w", padx=4, pady=(2, 5))
-            ttk.Entry(qbox, textvariable=avar, show="*").grid(row=idx * 2 + 1, column=1, sticky="ew", padx=4, pady=(2, 5))
+            ttk.Entry(qbox, textvariable=avar).grid(row=idx * 2 + 1, column=1, sticky="ew", padx=4, pady=(2, 5))
         qbox.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(left)
@@ -140,7 +144,7 @@ class CodespaceGui(tk.Tk):
         self.dwell_var = tk.StringVar(value=str(self.settings.get("dwell_seconds", 12)))
         self.cycles_var = tk.StringVar(value=str(self.settings.get("cycles", 0)))
         self.max_rotations_var = tk.StringVar(value=str(self.settings.get("max_rotations", 20)))
-        self.cooldown_minutes_var = tk.StringVar(value=str(self.settings.get("cooldown_minutes", 60)))
+        self.cooldown_minutes_var = tk.StringVar(value=str(self.settings.get("cooldown_minutes", 45)))
         self.min_gap_var = tk.StringVar(value=str(self.settings.get("min_gap_seconds", 15)))
         self.max_gap_var = tk.StringVar(value=str(self.settings.get("max_gap_seconds", 20)))
         self.session_duration_var = tk.StringVar(value=str(self.settings.get("session_duration_minutes", 60)))
@@ -299,7 +303,7 @@ class CodespaceGui(tk.Tk):
             "dwell_seconds": int(self.dwell_var.get() or "12"),
             "cycles": int(self.cycles_var.get() or "0"),
             "max_rotations": int(self.max_rotations_var.get() or "20"),
-            "cooldown_minutes": int(self.cooldown_minutes_var.get() or "60"),
+            "cooldown_minutes": int(self.cooldown_minutes_var.get() or "45"),
             "min_gap_seconds": int(self.min_gap_var.get() or "15"),
             "max_gap_seconds": int(self.max_gap_var.get() or "20"),
             "session_duration_minutes": int(self.session_duration_var.get() or "60"),
@@ -321,11 +325,21 @@ class CodespaceGui(tk.Tk):
         if path:
             self.extension_var.set(path)
 
+    def _open_path(self, path: Path):
+        # os.startfile is Windows-only; use the desktop opener elsewhere.
+        path.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+
     def _open_folder(self):
-        os.startfile(str(CODESPACE_DIR))
+        self._open_path(CODESPACE_DIR)
 
     def _open_logs(self):
-        os.startfile(str(LOGS_DIR))
+        self._open_path(LOGS_DIR)
 
     def _start(self):
         if self.proc and self.proc.poll() is None:
@@ -364,7 +378,7 @@ class CodespaceGui(tk.Tk):
             "--max-rotations",
             str(int(self.max_rotations_var.get() or "20")),
             "--cooldown-seconds",
-            str(int(self.cooldown_minutes_var.get() or "60") * 60),
+            str(int(self.cooldown_minutes_var.get() or "45") * 60),
             "--min-gap-seconds",
             str(int(self.min_gap_var.get() or "15")),
             "--max-gap-seconds",
@@ -390,6 +404,8 @@ class CodespaceGui(tk.Tk):
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            # Own process group on Linux/macOS so Stop can close Chrome and every runner.
+            start_new_session=(os.name != "nt"),
         )
         threading.Thread(target=self._read_process, args=(self.proc, log_path), daemon=True).start()
 
@@ -398,7 +414,23 @@ class CodespaceGui(tk.Tk):
             self._log("No running process.")
             return
         self._log("Stopping process...")
-        self.proc.terminate()
+        if os.name == "nt":
+            self.proc.terminate()
+            return
+        # Signal the whole group: orchestrator, runners and the Chrome they launched.
+        pid = self.proc.pid
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        self.after(8000, lambda: self._force_stop(pid))
+
+    def _force_stop(self, pid: int):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            self._log("Force-closed remaining browser processes.")
+        except ProcessLookupError:
+            pass
 
     def _read_process(self, proc, log_path: Path):
         with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
@@ -406,7 +438,10 @@ class CodespaceGui(tk.Tk):
                 log_file.write(line)
                 log_file.flush()
                 self.log_queue.put(line.rstrip())
-            self.log_queue.put(f"Process exited with code {proc.wait()}")
+            code = proc.wait()
+            self.log_queue.put(f"Process exited with code {code}")
+            if code in EXIT_MESSAGES:
+                self.log_queue.put(EXIT_MESSAGES[code])
 
     def _drain_log_queue(self):
         while True:

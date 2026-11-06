@@ -78,14 +78,14 @@ async def handle_security_question(page: Page, customer: str, log: logging.Logge
             input_loc = inputs.nth(i)
             if not await input_loc.is_visible():
                 continue
-                
+
             if i < len(questions):
                 textToMatch = questions[i]
                 answer = match_answer(textToMatch, answers)
                 if not answer:
                     log.error(f"No answer found mapped for question: '{textToMatch}'")
                     continue
-                    
+
                 await input_loc.fill("")
                 await human_delay(100, 200)
                 await input_loc.type(answer, delay=random.randint(50, 150))

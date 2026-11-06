@@ -1,3 +1,4 @@
+import re
 import time
 import asyncio
 import logging
@@ -8,6 +9,29 @@ from src.auth.captcha import solve_captcha_on_page
 class CloudflareBlockException(Exception):
     pass
 
+TURNSTILE_STALL_SECONDS = 180  # a Turnstile that stays unsolved this long ends the account (exit 43)
+
+
+BLOCK_PATTERNS = [
+    r"you have been blocked", r"why have i been blocked", r"error 1020", r"error 1015",
+    r"rate limited", r"too many requests", r"error 429", r"access denied",
+    r"error (?:code )?10(?:06|07|08|10|12)", r"error (?:code )?5(?:2\d|30)", r"unable to access",
+]
+
+
+async def detect_block(page: Page) -> str | None:
+    """Return the matched Cloudflare or portal block marker from the current page, or None."""
+    try:
+        text = (await page.inner_text("body")).lower() + " " + (await page.title()).lower()
+    except Exception:
+        return None
+    for pattern in BLOCK_PATTERNS:
+        if re.search(pattern, text):
+            return pattern
+    return None
+
+
+
 async def wait_for_waiting_room(
     page: Page,
     log: logging.Logger,
@@ -16,6 +40,7 @@ async def wait_for_waiting_room(
 ) -> None:
     deadline = time.time() + timeout_minutes * 60
     log.info("Checking for Cloudflare Waiting Room …")
+    challenge_since: float | None = None  # when a Turnstile challenge (not a queue) first appeared
 
     while time.time() < deadline:
         if ready_selector:
@@ -47,12 +72,29 @@ async def wait_for_waiting_room(
         ):
             log.error("Cloudflare blocked the page (Error 1020/524).")
             raise CloudflareBlockException("Cloudflare Blocked Page Detected")
+
+        marker = await detect_block(page)
+        if marker:
+            log.error(f"Block or rate-limit page detected before login (marker '{marker}').")
+            raise CloudflareBlockException(f"Block page detected: {marker}")
         
         in_queue = any(kw in html.lower() for kw in [
             "waiting room", "you are in the queue", "queue position",
             "estimated wait", "waitingroom", "cfwaitingroom", "waiting-room",
             "just a moment", "verify you are human", "challenge-platform"
         ]) or "moment" in title.lower()
+
+        is_turnstile = any(kw in html_lower for kw in ["just a moment", "verify you are human", "challenge-platform"]) \
+            and not any(kw in html_lower for kw in ["waiting room", "you are in the queue", "queue position", "estimated wait"])
+        if is_turnstile:
+            if challenge_since is None:
+                challenge_since = time.time()
+                log.info("Cloudflare Turnstile challenge appeared before login; solving it.")
+            elif time.time() - challenge_since > TURNSTILE_STALL_SECONDS:
+                log.error(f"Turnstile not cleared after {TURNSTILE_STALL_SECONDS}s. Treating as a block.")
+                raise CloudflareBlockException("Turnstile stalled before login")
+        else:
+            challenge_since = None
 
         if not in_queue:
             log.info(f"Waiting room cleared — URL: {page.url}")
